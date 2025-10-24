@@ -2,12 +2,13 @@ import argparse
 from config import RANDOM_SEED
 from dataset import Dataset
 import numpy as np
-import wandb
-from wandb.keras import WandbCallback, WandbModelCheckpoint
 import tensorflow as tf
 from model import build_densenet121_model
 from optimizer import build_sgd_optimizer
 from utils import str2bool
+import os
+import json
+import time
 
 dataset = None
 
@@ -75,6 +76,9 @@ def run_experiment(config=None, log_to_wandb=True, verbose=0):
     # setup callbacks
     callbacks = []
     if log_to_wandb:
+        # Import lazily to allow running without wandb installed
+        import wandb
+        from wandb.keras import WandbCallback, WandbModelCheckpoint
         wandb_callback = WandbCallback(
             monitor="val_top_1",
             mode="max",
@@ -91,18 +95,67 @@ def run_experiment(config=None, log_to_wandb=True, verbose=0):
             )
             callbacks.append(wandb_model_checkpoint)
         
+    # compute model params and size
+    total_params = model.count_params()
+    bytes_total = 0
+    for v in model.weights:
+        try:
+            bytes_total += v.shape.num_elements() * tf.as_dtype(v.dtype).size
+        except Exception:
+            pass
+    size_mb = bytes_total / (1024 * 1024)
+    print(f"[INFO] Model parameters: {total_params}")
+    print(f"[INFO] Approx model size (MB): {size_mb:.2f}")
+
     # train model
-    model.fit(train_dataset,
-              epochs=config['num_epochs'],
-              verbose=verbose,
-              validation_data=validation_dataset,
-              callbacks=callbacks)
+    t0 = time.time()
+    hist = model.fit(train_dataset,
+                     epochs=config['num_epochs'],
+                     verbose=verbose,
+                     validation_data=validation_dataset,
+                     callbacks=callbacks)
+    t1 = time.time()
+    train_time_sec = t1 - t0
+    sec_per_epoch = train_time_sec / config['num_epochs'] if config['num_epochs'] > 0 else train_time_sec
+    print(f"[INFO] Training time (s): {train_time_sec:.2f} | per epoch: {sec_per_epoch:.2f}")
+
+    # optionally save weights when not using W&B
+    if config['save_weights'] and not log_to_wandb:
+        try:
+            out_dir = os.path.join("artifacts", "local", "weights")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, "ckpt")
+            model.save_weights(out_path)
+            print(f"[INFO] Saved weights to {out_path}")
+        except Exception as e:
+            print(f"[WARN] Could not save weights locally: {e}")
+
+    # save local report
+    try:
+        os.makedirs("artifacts/reports", exist_ok=True)
+        report = {
+            'config': dict(config),
+            'model': {
+                'total_params': int(total_params),
+                'approx_size_mb': float(f"{size_mb:.4f}")
+            },
+            'training': {
+                'total_time_sec': float(f"{train_time_sec:.4f}"),
+                'sec_per_epoch': float(f"{sec_per_epoch:.4f}")
+            }
+        }
+        with open("artifacts/reports/train_report.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        print("[INFO] Saved training report to artifacts/reports/train_report.json")
+    except Exception as e:
+        print(f"[WARN] Could not save training report: {e}")
 
     # get the logs of the model
-    return model.history
+    return hist
 
 
 def agent_fn(config, project, entity, verbose=0):
+    import wandb
     wandb.init(entity=entity, project=project, config=config,
                reinit=True, settings=wandb.Settings(code_dir="."))
     _ = run_experiment(config=wandb.config, log_to_wandb=True, verbose=verbose)
@@ -141,7 +194,10 @@ def main(args):
     }
 
     project_name = args.dataset + "_" + args.project
-    agent_fn(config=config, entity=args.entity, project=project_name, verbose=2)
+    if args.use_wandb:
+        agent_fn(config=config, entity=args.entity, project=project_name, verbose=2)
+    else:
+        _ = run_experiment(config=config, log_to_wandb=False, verbose=2)
 
 
 if __name__ == "__main__":
@@ -152,6 +208,8 @@ if __name__ == "__main__":
                         help='Project name', default='training')
     parser.add_argument('--dataset', type=str,
                         help='Name of dataset', default='wlasl100_tssi')
+    parser.add_argument('--use_wandb', type=str2bool,
+                        help='Log to Weights & Biases', default=True)
     parser.add_argument('--concat_validation_to_train', type=str2bool,
                         help='Add validation set to training set', default=False)
     parser.add_argument('--save_weights', type=str2bool,
